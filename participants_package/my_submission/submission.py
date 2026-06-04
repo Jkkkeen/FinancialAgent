@@ -72,12 +72,27 @@ class Position:
 
 
 @dataclass
+class DispositionStats:
+    gain_opportunities: int = 0
+    loss_opportunities: int = 0
+    gain_sells: int = 0
+    loss_sells: int = 0
+
+    @property
+    def de(self) -> float:
+        pgr = self.gain_sells / self.gain_opportunities if self.gain_opportunities else 0.0
+        plr = self.loss_sells / self.loss_opportunities if self.loss_opportunities else 0.0
+        return pgr - plr
+
+
+@dataclass
 class OptimizedAgent:
     agent_id: str
     cash: float = 100_000.0
     positions: Dict[str, Position] = field(default_factory=dict)
     seed: Optional[int] = None
     beliefs: Dict[str, Belief] = field(default_factory=dict)
+    disposition_stats: Dict[str, DispositionStats] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         base_seed = self.seed
@@ -163,6 +178,7 @@ class OptimizedAgent:
         price = self.current_price(symbol)
         if price <= 0:
             return AgentDecision(self.agent_id, symbol, "hold", 0, 0.0, "No price data available.", 0.0, 0)
+        stats = self.disposition_stats.setdefault(symbol, DispositionStats())
 
         unrealized = 0.0
         if position > 0 and avg_cost > 0:
@@ -189,29 +205,58 @@ class OptimizedAgent:
 
         target_turnover = 0.095
         target_notional = equity * target_turnover
+        target_quantity = max(int(target_notional / price / 100) * 100, 100)
 
-        if score > buy_threshold and position == 0:
+        if stats.de < 0.05:
+            profit_trigger = 0.05
+            profit_score_ceiling = 0.24
+            loss_sell_floor = -0.34
+        elif stats.de > 0.15:
+            profit_trigger = 0.14
+            profit_score_ceiling = 0.02
+            loss_sell_floor = -0.24
+        else:
+            profit_trigger = 0.08
+            profit_score_ceiling = 0.14
+            loss_sell_floor = -0.30
+
+        strong_bullish_context = belief.sentiment > 0.15 and belief.momentum > 0.10 and score > 0.08
+
+        if position > 0 and unrealized > 0.25 and score <= 0.32:
+            action = "sell"
+            quantity = min(target_quantity, position)
+            limit_price = price * 0.995
+            score = min(score, -0.10)
+        elif (
+            position > 0
+            and unrealized > profit_trigger
+            and score <= profit_score_ceiling
+            and not strong_bullish_context
+        ):
+            action = "sell"
+            quantity = min(target_quantity, position)
+            limit_price = price * 0.995
+            score = min(score, -0.08)
+        elif score > buy_threshold and position == 0:
             action = "buy"
-            quantity = max(int(target_notional / price / 100) * 100, 100)
+            quantity = target_quantity
             if quantity * price > cash:
                 quantity = int(cash / price / 100) * 100
             limit_price = price * 1.005
         elif score < sell_threshold and position > 0:
-            action = "sell"
-            quantity = max(int(target_notional / price / 100) * 100, 100)
-            quantity = min(quantity, position)
-            limit_price = price * 0.995
-        elif position > 0 and unrealized > 0.25:
-            # Force take-profit on very large gains
-            action = "sell"
-            quantity = max(int(target_notional / price / 100) * 100, 100)
-            quantity = min(quantity, position)
-            limit_price = price * 0.995
-            score = -0.15
-        elif score > 0 and cash > price * 100:
+            if unrealized < -0.05 and score > loss_sell_floor:
+                action = "hold"
+                quantity = 0
+                limit_price = price
+                score = 0.0
+            else:
+                action = "sell"
+                quantity = min(target_quantity, position)
+                limit_price = price * 0.995
+        elif score > 0 and cash > price * 100 and position == 0:
             # Mild positive conviction with cash available: small buy for turnover
             action = "buy"
-            quantity = max(int(target_notional / price / 100) * 100, 100)
+            quantity = target_quantity
             if quantity * price > cash:
                 quantity = int(cash / price / 100) * 100
             limit_price = price * 1.005
@@ -245,6 +290,7 @@ class OptimizedAgent:
             output_belief = 0.0
 
         thought = self._build_thought(symbol, belief, action, unrealized, score)
+        self._record_disposition(symbol, unrealized, action)
 
         return AgentDecision(
             agent_id=self.agent_id,
@@ -256,6 +302,17 @@ class OptimizedAgent:
             belief_score=round(float(output_belief), 4),
             sentiment_class=sentiment_class,
         )
+
+    def _record_disposition(self, symbol: str, unrealized: float, action: str) -> None:
+        stats = self.disposition_stats.setdefault(symbol, DispositionStats())
+        if unrealized > 0:
+            stats.gain_opportunities += 1
+            if action == "sell":
+                stats.gain_sells += 1
+        elif unrealized < 0:
+            stats.loss_opportunities += 1
+            if action == "sell":
+                stats.loss_sells += 1
 
     def _build_thought(self, symbol: str, belief: Belief, action: str, unrealized: float, score: float) -> str:
         parts = [f"Analyzing {symbol}"]
