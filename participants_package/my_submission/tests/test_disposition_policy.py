@@ -36,6 +36,39 @@ class DispositionPolicyTests(unittest.TestCase):
 
         self.assertNotEqual(decision.action, "sell")
 
+    def test_llm_bullish_advice_protects_winner_from_mechanical_profit_taking(self):
+        def fake_llm(system, user):
+            return """
+            {
+              "market_view": "bullish",
+              "sentiment_score": 0.8,
+              "confidence": 0.9,
+              "take_profit_bias": 0.0,
+              "loss_hold_bias": 0.4,
+              "risk_warning": false,
+              "reason": "The rally is supported by broad positive context."
+            }
+            """
+
+        agent = OptimizedAgent("llm_winner", cash=50_000, seed=7, llm_client=fake_llm)
+        agent.ingest_market("SIM", make_klines([109, 110, 110, 109, 110] * 6))
+        agent.ingest_news("SIM", ["management update and sector demand commentary"])
+        decision = agent.decide("SIM", cash=50_000, position=500, avg_cost=100.0)
+
+        self.assertEqual(decision.action, "hold")
+        self.assertIn("LLM context", decision.thought)
+
+    def test_llm_failure_falls_back_to_rule_decision(self):
+        def failing_llm(system, user):
+            raise RuntimeError("network unavailable")
+
+        agent = OptimizedAgent("llm_fallback", cash=50_000, seed=13, llm_client=failing_llm)
+        agent.ingest_market("SIM", make_klines([95, 96, 97, 98, 99] * 6))
+        agent.ingest_news("SIM", ["growth upgrade"])
+        decision = agent.decide("SIM", cash=50_000, position=0, avg_cost=0.0)
+
+        self.assertIn(decision.action, {"buy", "sell", "hold"})
+
 
 if __name__ == "__main__":
     unittest.main()

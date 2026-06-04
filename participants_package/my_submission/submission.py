@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import hashlib
 import itertools
+import json
 import math
 import random
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from typing import Any, Deque, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from submission_interface.api import (
     AgentDecision,
@@ -30,6 +31,8 @@ from submission_interface.api import (
 # ============================================================
 # Task 1: Optimized Investment Agent
 # ============================================================
+
+LLMClient = Callable[[str, str], str]
 
 POSITIVE_WORDS = {
     "beat", "growth", "upgrade", "bull", "surge", "profit", "strong",
@@ -86,6 +89,17 @@ class DispositionStats:
 
 
 @dataclass
+class LLMAdvice:
+    market_view: str = "neutral"
+    sentiment_score: float = 0.0
+    confidence: float = 0.0
+    take_profit_bias: float = 0.5
+    loss_hold_bias: float = 0.5
+    risk_warning: bool = False
+    reason: str = ""
+
+
+@dataclass
 class OptimizedAgent:
     agent_id: str
     cash: float = 100_000.0
@@ -93,6 +107,7 @@ class OptimizedAgent:
     seed: Optional[int] = None
     beliefs: Dict[str, Belief] = field(default_factory=dict)
     disposition_stats: Dict[str, DispositionStats] = field(default_factory=dict)
+    llm_client: Optional[LLMClient] = None
 
     def __post_init__(self) -> None:
         base_seed = self.seed
@@ -186,8 +201,11 @@ class OptimizedAgent:
 
         equity = max(cash + position * price, 1.0)
         value_gap = _clip((belief.fair_value / price - 1.0) * 8.0, -1.0, 1.0)
+        advice = self._llm_advice(symbol, belief, price, position, avg_cost, unrealized, value_gap)
 
         raw_intention = 0.55 * belief.score + 0.25 * value_gap + 0.10
+        if advice:
+            raw_intention += 0.08 * advice.sentiment_score * advice.confidence
 
         # Disposition effect: moderate sell bias when in profit, strong hold when in loss
         disposition_strength = 0.15
@@ -220,7 +238,17 @@ class OptimizedAgent:
             profit_score_ceiling = 0.14
             loss_sell_floor = -0.30
 
+        if advice:
+            profit_trigger += 0.04 * (1.0 - advice.take_profit_bias) * advice.confidence
+            profit_score_ceiling -= 0.10 * (1.0 - advice.take_profit_bias) * advice.confidence
+            loss_sell_floor -= 0.08 * advice.loss_hold_bias * advice.confidence
+            if advice.risk_warning:
+                profit_trigger = max(0.04, profit_trigger - 0.03)
+                profit_score_ceiling += 0.06
+
         strong_bullish_context = belief.sentiment > 0.15 and belief.momentum > 0.10 and score > 0.08
+        if advice and advice.market_view == "bullish" and advice.confidence >= 0.55:
+            strong_bullish_context = strong_bullish_context or advice.sentiment_score >= 0.20
 
         if position > 0 and unrealized > 0.25 and score <= 0.32:
             action = "sell"
@@ -289,7 +317,7 @@ class OptimizedAgent:
             sentiment_class = 0
             output_belief = 0.0
 
-        thought = self._build_thought(symbol, belief, action, unrealized, score)
+        thought = self._build_thought(symbol, belief, action, unrealized, score, advice)
         self._record_disposition(symbol, unrealized, action)
 
         return AgentDecision(
@@ -314,7 +342,108 @@ class OptimizedAgent:
             if action == "sell":
                 stats.loss_sells += 1
 
-    def _build_thought(self, symbol: str, belief: Belief, action: str, unrealized: float, score: float) -> str:
+    def _llm_advice(
+        self,
+        symbol: str,
+        belief: Belief,
+        price: float,
+        position: int,
+        avg_cost: float,
+        unrealized: float,
+        value_gap: float,
+    ) -> Optional[LLMAdvice]:
+        if self.llm_client is None:
+            return None
+
+        recent_closes = [row["close"] for row in self._market.get(symbol, [])[-10:]]
+        news = self._news.get(symbol, [])[-8:]
+        system = (
+            "You are a financial-market context analyst. Return ONLY JSON. "
+            "Do not choose the final order; provide semantic advice for a rules-based trading agent."
+        )
+        user = json.dumps(
+            {
+                "symbol": symbol,
+                "recent_closes": recent_closes,
+                "news": news,
+                "belief": {
+                    "momentum": belief.momentum,
+                    "sentiment": belief.sentiment,
+                    "social_pressure": belief.social_pressure,
+                    "volatility": belief.volatility,
+                    "confidence": belief.confidence,
+                    "value_gap": value_gap,
+                },
+                "portfolio": {
+                    "price": price,
+                    "position": position,
+                    "avg_cost": avg_cost,
+                    "unrealized": unrealized,
+                },
+                "schema": {
+                    "market_view": "bullish|bearish|neutral",
+                    "sentiment_score": "float from -1 to 1",
+                    "confidence": "float from 0 to 1",
+                    "take_profit_bias": "float from 0 to 1; higher means take profit sooner",
+                    "loss_hold_bias": "float from 0 to 1; higher means hold losers longer",
+                    "risk_warning": "boolean",
+                    "reason": "short explanation",
+                },
+            },
+            ensure_ascii=False,
+        )
+
+        try:
+            raw = self.llm_client(system, user)
+            parsed = self._parse_llm_json(raw)
+        except Exception:
+            return None
+        if not parsed:
+            return None
+
+        view = str(parsed.get("market_view", "neutral")).lower()
+        if view not in {"bullish", "bearish", "neutral"}:
+            view = "neutral"
+        return LLMAdvice(
+            market_view=view,
+            sentiment_score=_clip(float(parsed.get("sentiment_score", 0.0)), -1.0, 1.0),
+            confidence=_clip(float(parsed.get("confidence", 0.0)), 0.0, 1.0),
+            take_profit_bias=_clip(float(parsed.get("take_profit_bias", 0.5)), 0.0, 1.0),
+            loss_hold_bias=_clip(float(parsed.get("loss_hold_bias", 0.5)), 0.0, 1.0),
+            risk_warning=bool(parsed.get("risk_warning", False)),
+            reason=str(parsed.get("reason", ""))[:160],
+        )
+
+    def _parse_llm_json(self, raw: str) -> Dict[str, Any]:
+        text = str(raw or "").strip()
+        if text.startswith("```"):
+            lines = text.splitlines()
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            text = "\n".join(lines).strip()
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            start = text.find("{")
+            end = text.rfind("}")
+            if start >= 0 and end > start:
+                try:
+                    return json.loads(text[start : end + 1])
+                except json.JSONDecodeError:
+                    return {}
+        return {}
+
+    def _build_thought(
+        self,
+        symbol: str,
+        belief: Belief,
+        action: str,
+        unrealized: float,
+        score: float,
+        advice: Optional[LLMAdvice] = None,
+    ) -> str:
         parts = [f"Analyzing {symbol}"]
         if belief.sentiment > 0.1:
             parts.append("news sentiment is positive")
@@ -323,6 +452,10 @@ class OptimizedAgent:
         else:
             parts.append("news sentiment is mixed")
         parts.append(f"momentum signal at {belief.momentum:.2f}")
+        if advice:
+            parts.append(
+                f"LLM context is {advice.market_view} with confidence {advice.confidence:.2f}"
+            )
         if unrealized > 0.05:
             parts.append(f"sitting on {unrealized:.0%} unrealized gain, tempted to lock in profit")
         elif unrealized < -0.05:
@@ -703,12 +836,27 @@ class TeamSubmission(CompetitionSubmission):
         self.agents: Dict[str, OptimizedAgent] = {}
         self.exchange = EnhancedExchange()
         self.seed = 0
+        self.llm_client: Optional[LLMClient] = None
+        self._configure_llm()
 
     def reset(self, seed: int = 0, config: Optional[Mapping[str, Any]] = None) -> None:
         self.config.update(dict(config or {}))
         self.agents = {}
         self.exchange = EnhancedExchange()
         self.seed = seed
+        self._configure_llm()
+
+    def _configure_llm(self) -> None:
+        if not self.config.get("use_llm", False):
+            self.llm_client = None
+            return
+        try:
+            from llm_helper import create_llm_client
+
+            config_path = str(self.config.get("llm_config_path", "config.yaml"))
+            self.llm_client = create_llm_client(config_path)
+        except Exception:
+            self.llm_client = None
 
     def decide(self, observation: MarketObservation) -> AgentDecision:
         agent = self.agents.get(observation.agent_id)
@@ -717,8 +865,10 @@ class TeamSubmission(CompetitionSubmission):
                 agent_id=observation.agent_id,
                 cash=observation.cash,
                 seed=self.seed + len(self.agents),
+                llm_client=self.llm_client,
             )
             self.agents[observation.agent_id] = agent
+        agent.llm_client = self.llm_client
 
         agent.cash = observation.cash
         if observation.position > 0:
