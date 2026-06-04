@@ -1,0 +1,22 @@
+{
+  "train_days": 60,
+  "start_policy": "first_news_trading_day",
+  "calendar_dates_removed": true,
+  "symbols_replaced": true,
+  "original_symbols_saved": false,
+  "day_range": [
+    "第1天",
+    "第60天"
+  ],
+  "symbols": 10,
+  "market_rows": 600,
+  "news_days": 55,
+  "news_items": 437,
+  "files": [
+    "stock_data_60d_anonymized.csv",
+    "trading_days_60d_anonymized.csv",
+    "stock_profile_60d_anonymized.csv",
+    "news_60d_anonymized.jsonl",
+    "metadata.json"
+  ]
+}

@@ -1,0 +1,65 @@
+# ============================================================
+# 配置模板
+# 使用方式:
+#   1. 复制此文件为 config.yaml:  cp config.example.yaml config.yaml
+#   2. 填入你的配置值
+#   3. 设置环境变量:  export API_KEY="your-key-here"
+# ============================================================
+
+# --- LLM 提供商设置 ---
+llm:
+  # 提供商: "deepseek" | "openai" | "anthropic" | "custom"
+  provider: "aihubmix"
+
+  # OpenAI 兼容接口
+  base_url: ""
+
+  # 模型名称
+  model: "deepseek-v4-flash"
+
+  # 生成温度（0.0 = 确定性, 1.0 = 高创造性）
+  temperature: 0.7
+
+  # 每次响应的最大 token 数
+  max_tokens: 256
+
+  # API key 的环境变量名
+  # 通过环境变量设置: export API_KEY="sk-..."
+  api_key_env: "API_KEY"
+
+# --- Agent 设置 ---
+agents:
+  # 性格分布（总和应接近 1.0）
+  # 🔧 MODIFIABLE: 用于给新 Agent 分配默认风格
+  personality_mix:
+    trend: 0.30       # 趋势型 — 追涨杀跌
+    value: 0.30       # 价值型 — 长期持有
+    aggressive: 0.25   # 激进型 — 高换手率
+    anxious: 0.15      # 焦虑型 — 过度反应
+
+  # 新 Agent 的默认性格
+  default_personality: "trend"
+
+# --- 交易所设置 ---
+exchange:
+  # 价格变动最小单位
+  tick_size: 0.01
+
+  # 🔧 MODIFIABLE: 监管检测阈值
+  # 洗盘检测窗口（tick 数）
+  wash_trade_window: 8
+  # 虚假申报检测窗口（tick 数，在此窗口内取消大单）
+  spoof_cancel_window: 3
+  # 大单判定比例（订单量 / 平均深度 > 此值为大单）
+  large_order_ratio: 4.0
+  # 拉高抛售检测窗口（tick 数）
+  pump_window: 12
+
+# --- 实验跟踪 ---
+experiment:
+  # 实验名称（用于日志目录）
+  name: "baseline"
+  # 随机种子（相同种子产生相同结果）
+  seed: 42
+  # 日志输出目录
+  log_dir: "./logs"
