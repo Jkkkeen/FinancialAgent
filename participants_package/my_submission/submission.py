@@ -33,6 +33,7 @@ from submission_interface.api import (
 # ============================================================
 
 LLMClient = Callable[[str, str], str]
+LLMCallGate = Callable[[], bool]
 
 POSITIVE_WORDS = {
     "beat", "growth", "upgrade", "bull", "surge", "profit", "strong",
@@ -108,6 +109,8 @@ class OptimizedAgent:
     beliefs: Dict[str, Belief] = field(default_factory=dict)
     disposition_stats: Dict[str, DispositionStats] = field(default_factory=dict)
     llm_client: Optional[LLMClient] = None
+    llm_cache: Optional[Dict[str, Optional[LLMAdvice]]] = None
+    llm_call_gate: Optional[LLMCallGate] = None
 
     def __post_init__(self) -> None:
         base_seed = self.seed
@@ -118,6 +121,8 @@ class OptimizedAgent:
         self._market: Dict[str, List[Dict[str, float]]] = {}
         self._news: Dict[str, List[str]] = {}
         self._social: Dict[str, List[Mapping[str, Any]]] = {}
+        if self.llm_cache is None:
+            self.llm_cache = {}
 
     def ingest_market(self, symbol: str, klines: List[Dict[str, Any]]) -> None:
         rows = []
@@ -357,6 +362,17 @@ class OptimizedAgent:
 
         recent_closes = [row["close"] for row in self._market.get(symbol, [])[-10:]]
         news = self._news.get(symbol, [])[-8:]
+        if not self._should_query_llm(news, belief, position, unrealized, value_gap):
+            return None
+
+        cache_key = self._llm_cache_key(news, belief, position, unrealized, value_gap)
+        cache = self.llm_cache if self.llm_cache is not None else {}
+        if cache_key in cache:
+            return cache[cache_key]
+        if self.llm_call_gate is not None and not self.llm_call_gate():
+            cache[cache_key] = None
+            return None
+
         system = (
             "You are a financial-market context analyst. Return ONLY JSON. "
             "Do not choose the final order; provide semantic advice for a rules-based trading agent."
@@ -397,14 +413,16 @@ class OptimizedAgent:
             raw = self.llm_client(system, user)
             parsed = self._parse_llm_json(raw)
         except Exception:
+            cache[cache_key] = None
             return None
         if not parsed:
+            cache[cache_key] = None
             return None
 
         view = str(parsed.get("market_view", "neutral")).lower()
         if view not in {"bullish", "bearish", "neutral"}:
             view = "neutral"
-        return LLMAdvice(
+        advice = LLMAdvice(
             market_view=view,
             sentiment_score=_clip(float(parsed.get("sentiment_score", 0.0)), -1.0, 1.0),
             confidence=_clip(float(parsed.get("confidence", 0.0)), 0.0, 1.0),
@@ -413,6 +431,52 @@ class OptimizedAgent:
             risk_warning=bool(parsed.get("risk_warning", False)),
             reason=str(parsed.get("reason", ""))[:160],
         )
+        cache[cache_key] = advice
+        return advice
+
+    def _should_query_llm(
+        self,
+        news: List[str],
+        belief: Belief,
+        position: int,
+        unrealized: float,
+        value_gap: float,
+    ) -> bool:
+        if news:
+            return True
+        signal_conflict = (
+            (belief.momentum > 0.12 and value_gap < -0.12)
+            or (belief.momentum < -0.12 and value_gap > 0.12)
+            or (belief.momentum > 0.12 and belief.sentiment < -0.08)
+            or (belief.momentum < -0.12 and belief.sentiment > 0.08)
+        )
+        disposition_boundary = position > 0 and (
+            0.04 <= unrealized <= 0.18 or -0.18 <= unrealized <= -0.04
+        )
+        return signal_conflict or disposition_boundary
+
+    def _llm_cache_key(
+        self,
+        news: List[str],
+        belief: Belief,
+        position: int,
+        unrealized: float,
+        value_gap: float,
+    ) -> str:
+        news_text = "\n".join(item.strip().lower() for item in news if str(item).strip())
+        digest = hashlib.sha256(news_text.encode("utf-8")).hexdigest()[:16] if news_text else "no-news"
+        momentum_bucket = _bucket(belief.momentum, 0.12)
+        value_bucket = _bucket(value_gap, 0.12)
+        sentiment_bucket = _bucket(belief.sentiment, 0.08)
+        if position <= 0:
+            position_bucket = "flat"
+        elif unrealized > 0.05:
+            position_bucket = "gain"
+        elif unrealized < -0.05:
+            position_bucket = "loss"
+        else:
+            position_bucket = "near_cost"
+        return "|".join([digest, momentum_bucket, value_bucket, sentiment_bucket, position_bucket])
 
     def _parse_llm_json(self, raw: str) -> Dict[str, Any]:
         text = str(raw or "").strip()
@@ -837,6 +901,9 @@ class TeamSubmission(CompetitionSubmission):
         self.exchange = EnhancedExchange()
         self.seed = 0
         self.llm_client: Optional[LLMClient] = None
+        self.llm_cache: Dict[str, Optional[LLMAdvice]] = {}
+        self.llm_calls_used = 0
+        self.llm_max_calls = self._configured_llm_max_calls()
         self._configure_llm()
 
     def reset(self, seed: int = 0, config: Optional[Mapping[str, Any]] = None) -> None:
@@ -844,7 +911,25 @@ class TeamSubmission(CompetitionSubmission):
         self.agents = {}
         self.exchange = EnhancedExchange()
         self.seed = seed
+        self.llm_cache = {}
+        self.llm_calls_used = 0
+        self.llm_max_calls = self._configured_llm_max_calls()
         self._configure_llm()
+
+    def _configured_llm_max_calls(self) -> int:
+        value = self.config.get("llm_max_calls", self.config.get("max_llm_calls", 24))
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 24
+
+    def _allow_llm_call(self) -> bool:
+        if self.llm_max_calls < 0:
+            return True
+        if self.llm_calls_used >= self.llm_max_calls:
+            return False
+        self.llm_calls_used += 1
+        return True
 
     def _configure_llm(self) -> None:
         if not self.config.get("use_llm", False):
@@ -866,9 +951,13 @@ class TeamSubmission(CompetitionSubmission):
                 cash=observation.cash,
                 seed=self.seed + len(self.agents),
                 llm_client=self.llm_client,
+                llm_cache=self.llm_cache,
+                llm_call_gate=self._allow_llm_call,
             )
             self.agents[observation.agent_id] = agent
         agent.llm_client = self.llm_client
+        agent.llm_cache = self.llm_cache
+        agent.llm_call_gate = self._allow_llm_call
 
         agent.cash = observation.cash
         if observation.position > 0:
@@ -971,3 +1060,9 @@ def _returns(closes: List[float]) -> List[float]:
 
 def _clip(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
+
+
+def _bucket(value: float, step: float) -> str:
+    if step <= 0:
+        return "0"
+    return str(int(round(value / step)))

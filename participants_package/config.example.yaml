@@ -19,9 +19,7 @@ llm:
 
   # 生成温度（0.0 = 确定性, 1.0 = 高创造性）
   temperature: 0.2
-
-  # 每次响应的最大 token 数
-  max_tokens: 256
+  max_tokens: 4096
 
   # API key 的环境变量名
   # 通过环境变量设置: export API_KEY="sk-..."
